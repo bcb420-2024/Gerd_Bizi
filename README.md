@@ -5,7 +5,7 @@ Hello, my name is Gerd Bizi! I'm a fourth-year student studying Computer Science
 ### Wiki
 Link to Gerd Bizi's [Wiki](https://github.com/bcb420-2024/Gerd_Bizi/wiki)
 
-Shield: [![CC BY 4.0][cc-by-shield]][cc-by]
+[![CC BY 4.0][cc-by-shield]][cc-by]
 
 This work is licensed under a
 [Creative Commons Attribution 4.0 International License][cc-by].
