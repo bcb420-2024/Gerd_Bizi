@@ -1,0 +1,435 @@
+---
+title: "Assignment #1 - Data Set Selection and Initial Processing"
+author: "Gerd Bizi"
+date: "2024-02-21"
+fig_width: 10
+fig_height: 10
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+bibliography: a1_references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+warning = FALSE
+message = FALSE
+echo = FALSE
+```
+
+# Background
+
+In the BCB420H1 course, my first assignment was to analyze an RNASeq dataset of particular interest to me. The first phase of this overarching project was to first pick the dataset, and to then perform the initial pre-processing, including normalization of the data, along with mapping our genes to their corresponding HUGO symbols.
+
+## Why is this dataset of interest to you?
+
+I chose to work with the [GSE205517](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE205517) dataset since it tied with my part-time research I did last summer. My project, which admittedly didn't go as far as I'd hoped, was to look at regulators for key proteins involved in the differentiation process of induced pluripotent stem cells into ventricular cardiomyocytes. The interest here was that if several regulators were identified, this could be used to temporally upregulate these regulators to more efficiently induce differentiation into cardiomyocytes for patient use. Unfortunately, time commitments and other plans derailed the project, but it left me still wanting to explore it, and perhaps return to my PI with a new lead on the project. Perhaps this course could serve as a springboard for that!
+
+Without any further ado, let's begin our analysis!
+
+## Loading in Libraries
+
+Here we will load in the libraries we will be using for our analysis.
+
+```{r, include=FALSE}
+if (! requireNamespace("GEOquery", quietly = TRUE)) {
+  BiocManager::install("GEOquery")
+}
+
+if (!requireNamespace("edgeR", quietly = TRUE)) {
+  install.packages("edgeR")
+}
+
+if (!requireNamespace("knitr", quietly = TRUE)) {
+  install.packages("knitr")
+}
+
+if (!requireNamespace("HGNC", quietly = TRUE)) {
+  install.packages("hgnc")
+}
+
+library(GEOquery)
+library(edgeR)
+library(knitr)
+library(httr)
+library(data.table)
+library(hgnc)
+library(RColorBrewer)
+```
+
+# Retrieving our Data from the GEO
+
+First, we will retrieve our dataset from the Gene Expression Omnibus (GEO). We must notice that the dataset we selected was a SuperSeries. Therefore, we are going to load in two different datasets from the GEO and then combine them
+
+```{r}
+# GEO Accession numbers
+geo_acc_1 <- "GSE203375"
+geo_acc_2 <- "GSE204885"
+
+# The filenames for saving/loading data
+filename_1 <- paste0(geo_acc_1, ".RData")
+filename_2 <- paste0(geo_acc_2, ".RData")
+
+# Reading in files from the GEO or locally
+if (!file.exists(filename_1)) {
+  gset_1 <- getGEO(geo_acc_1, GSEMatrix=TRUE, getGPL=FALSE)
+  saveRDS(gset_1, filename_1)
+} else {
+  gset_1 <- readRDS(filename_1)
+}
+gset_1 <- gset_1[[1]]
+
+if (!file.exists(filename_2)) {
+  gset_2 <- getGEO(geo_acc_2, GSEMatrix=TRUE, getGPL=FALSE)
+  saveRDS(gset_2, filename_2)
+} else {
+  gset_2 <- readRDS(filename_2)
+}
+gset_2 <- gset_2[[1]]
+```
+
+We now have our data loaded in. We now need to retrieve the counts tables from the GEO.
+
+```{r}
+# load counts table from GEO
+urld <- "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts"
+path_1 <- paste(urld, paste0("acc=", geo_acc_1), paste0("file=", geo_acc_1, "_raw_counts_GRCh38.p13_NCBI.tsv.gz"), sep="&");
+path_2 <- paste(urld, paste0("acc=", geo_acc_2), paste0("file=", geo_acc_2, "_raw_counts_GRCh38.p13_NCBI.tsv.gz"), sep="&");
+
+if (!file.exists(paste0(geo_acc_1,"_raw_counts.RData"))) {
+  counts_data_1 <- as.matrix(data.table::fread(path_1, header=T, colClasses="integer"), rownames=1)
+  name_mapping <- setNames(gset_1@phenoData@data[["title"]], gset_1@phenoData@data[["geo_accession"]])
+  colnames(counts_data_1) <- name_mapping[colnames(counts_data_1)]
+  saveRDS(counts_data, paste0(geo_acc_1, "_raw_counts.RData"))
+} else {
+  counts_data_1 <- readRDS(paste0(geo_acc_1, "_raw_counts.RData"))
+}
+
+if (!file.exists(paste0(geo_acc_2,"_raw_counts.RData"))) {
+  counts_data_2 <- as.matrix(data.table::fread(path_2, header=T, colClasses="integer"), rownames=1)
+  name_mapping <- setNames(gset_2@phenoData@data[["title"]], gset_2@phenoData@data[["geo_accession"]])
+  colnames(counts_data_2) <- name_mapping[colnames(counts_data_2)]
+  saveRDS(counts_data_2, paste0(geo_acc_2, "_raw_counts.RData"))
+} else {
+  counts_data_2 <- readRDS(paste0(geo_acc_2, "_raw_counts.RData"))
+}
+
+counts_data <- cbind(counts_data_1, counts_data_2) # combine matrices into one
+```
+
+# Briefly Explaining our Dataset
+
+Some basic information about the dataset can be obtained through the ExpressionSet we've read in. The study investigated differentiation of two different cell lines, H9 of karyotype 46, XX, and MLC2V of karyotype 46, XY, corresponding to cells originating from female and male sources, respectively. It then compared to to patient samples harvested from left and right atrial and ventricular tissue, along with cardiomyocytes individually harvested from each section of the heart from three patients each.
+
+We can look at the specific stats for the 
+```{r}
+gset_1@experimentData@title # study title
+gset_1@experimentData@abstract # study abstract
+gset_1@experimentData@other$overall_design # summary of experiment
+unique(gset_1@phenoData@data[["extract_protocol_ch1.1"]]) # platform
+
+unique(gset_1@phenoData@data[["experiment number:ch1"]]) # heart
+unique(gset_1@phenoData@data[["cell_line:ch1"]]) # cell lines
+unique(gset_1@phenoData@data[["day:ch1"]]) # day of differentiation
+
+gset_1@experimentData@other$platform_id # GPL id
+gset_1@experimentData@other$last_update_date # last update date
+unique(gset_1@phenoData@data$organism_ch1) # organism
+```
+
+```{r}
+gset_2@experimentData@title # study title
+gset_2@experimentData@abstract # study abstract
+gset_2@experimentData@other$overall_design # summary of experiment
+unique(gset_2@phenoData@data[["extract_protocol_ch1.1"]]) # platform
+
+unique(gset_2@phenoData@data[["chamber:ch1"]]) # cell lines
+unique(gset_2@phenoData@data[["patient:ch1"]]) # patient
+unique(gset_2@phenoData@data[["tissue:ch1"]]) # tissue
+
+gset_2@experimentData@other$platform_id # GPL id
+gset_2@experimentData@other$last_update_date # last update date
+unique(gset_2@phenoData@data$organism_ch1) # organism
+```
+
+```{r}
+sample_info_1 <- gset_1@phenoData@data[ , (ncol(gset_1@phenoData@data)-2):ncol(gset_1@phenoData@data)]
+colnames(sample_info_1) <- gsub(":ch1", "", colnames(sample_info_1)) 
+knitr::kable(sample_info_1, format = "pipe", caption = "<b>Table 1:</b> Sample information for Cardiomyocytes Derived from Stem Cells")
+```
+```{r}
+sample_info_2 <- gset_2@phenoData@data[ , (ncol(gset_2@phenoData@data)-2):ncol(gset_2@phenoData@data)]
+colnames(sample_info_2) <- gsub(":ch1", "", colnames(sample_info_2)) 
+knitr::kable(sample_info_2, format = "pipe", caption = "<b>Table 2:</b> Sample information for Patient-Derived Samples")
+```
+# Calculating Overview Statistics
+
+A good way to get an initial overview of our dataset is to calculate our overview stats. We will calculate those, and display them afterwards.
+
+```{r}
+overview_stats <- list()
+
+for (sample_name in colnames(counts_data)) {
+  sample_data <- counts_data[, sample_name]
+  
+  total_counts <- sum(sample_data)
+  mean_counts <- mean(sample_data)
+  median_counts <- median(sample_data)
+  sd_counts <- sd(sample_data)
+  var_counts <- var(sample_data)
+  genes_detected <- sum(sample_data > 1) # Check binarily--if there's a number, a transcript of a gene was detected
+  overview_stats[[sample_name]] <- c(total_counts, mean_counts, median_counts, sd_counts, var_counts, genes_detected)
+}
+
+overview_stats_df <- do.call(rbind, overview_stats)
+rownames(overview_stats_df) <- names(overview_stats)
+colnames(overview_stats_df) <- c("Total Counts", "Mean Counts", "Median Counts", "Counts Standard Deviation", "Counts Variation", "Genes Detected")
+
+knitr::kable(overview_stats_df[, ], format = "pipe", caption = "<b>Table 3:</b> Overview Statistics of Samples, Pre-Processed")
+```
+
+### Filtering Out Zero-Expressors
+
+We saw that in our genes detected column that there were around 21,000 genes expressed with at least one transcript for each condition. This being the case, there are most likely genes that are not expressed through all the conditions, and can thus be filtered out. We can re-examine our overview stats again after doing this.
+
+```{r}
+rows_to_keep <- apply(counts_data, 1, function(row) any(row != 0))
+counts_data_zero_filtered <- counts_data[rows_to_keep, ]
+
+overview_stats_zero_filtered <- list()
+
+for (sample_name in colnames(counts_data_zero_filtered)) {
+  sample_data <- counts_data_zero_filtered[, sample_name]
+  
+  total_counts <- sum(sample_data)
+  mean_counts <- mean(sample_data)
+  median_counts <- median(sample_data)
+  sd_counts <- sd(sample_data)
+  var_counts <- var(sample_data)
+  genes_detected <- sum(sample_data > 1) # Check binarily--if there's a number, a transcript of a gene was detected
+  overview_stats_zero_filtered[[sample_name]] <- c(total_counts, mean_counts, median_counts, sd_counts, var_counts, genes_detected)
+}
+
+overview_stats_zero_filtered_df <- do.call(rbind, overview_stats_zero_filtered)
+rownames(overview_stats_zero_filtered_df) <- names(overview_stats)
+colnames(overview_stats_zero_filtered_df) <- c("Total Counts", "Mean Counts", "Median Counts", "Counts Standard Deviation", "Counts Variation", "Genes Detected")
+
+knitr::kable(overview_stats_zero_filtered_df[, ], format = "pipe", caption = "<b>Table 4:</b> Overview Statistics After Eliminating Non-Expressed Genes")
+```
+
+```{r}
+print(nrow(counts_data))
+print(nrow(counts_data_zero_filtered))
+print(nrow(counts_data) - nrow(counts_data_zero_filtered))
+```
+
+Our mean and median counts increased across the board, as expected. We had 39376 genes, and we filtered out 3268 genes that we didn't express at all.
+
+# HGNC Mapping
+
+First, we will add a column to our zero-filtered data table with the appropriate NCBI gene ID. While we do have the annotation table, it is also true that we were specified to still manually perform this step. We will download a copy of the HGNC dataset. The dataset is confirmed to be up-to-date with the date of download.
+```{r}
+if (! file.exists("hgnc_genes.RData")) {
+  hgnc_genes <- import_hgnc_dataset(file=latest_archive_url())
+  saveRDS(hgnc_genes, "hgnc_genes.RData")
+} else {
+  hgnc_genes <- readRDS("hgnc_genes.RData")
+}
+hgnc_mapping <- hgnc_genes[, c('symbol', 'entrez_id')]
+```
+
+Now that we have a mapping, we can apply this to the table.
+
+```{r}
+counts_data_zero_filtered_df <- as.data.frame(counts_data_zero_filtered)
+counts_data_zero_filtered_df$NCBI_gene_id <- rownames(counts_data_zero_filtered_df)
+labelled_counts_data <- merge(counts_data_zero_filtered_df, hgnc_mapping, by.x = "NCBI_gene_id", by.y = 'entrez_id', all.x = TRUE)
+labelled_counts_data <- labelled_counts_data[,c(1, ncol(labelled_counts_data), 3:ncol(labelled_counts_data)-1)]
+
+knitr::kable(labelled_counts_data[c(1:10), c(1,2)], format = "pipe", caption = "<b>Table 5:</b> Table Matching First 10 NCBI Gene IDs to the Approved HGNC Symbols")
+
+labelled_counts_data <- labelled_counts_data[, -c(1)]
+```
+
+Now, we must deal with `NA` and empty values, along with many-to-one mappings.
+
+```{r}
+pre_normalized_counts <- labelled_counts_data[!is.na(labelled_counts_data$symbol), ]
+pre_normalized_counts <- pre_normalized_counts[pre_normalized_counts$symbol != '', ]
+
+print(nrow(labelled_counts_data))
+print(nrow(pre_normalized_counts))
+print(nrow(labelled_counts_data) - nrow(pre_normalized_counts))
+
+rownames(pre_normalized_counts) <- pre_normalized_counts[, 1]
+pre_normalized_counts <- pre_normalized_counts[, -c(1)]
+```
+
+We've thus eliminated 9093 genes, and are left with 27015 left.
+
+Additionally, the HGNC also ensures that each gene is only assigned one symbol, so as a result, we should not worry about one-to-many mappings. (https://www.genenames.org/about/guidelines/)
+
+# Normalization
+
+## Presentation Diagram
+
+```{r}
+bplot <- function(data, title) {
+  boxplot(log2(cpm(data+0.1)), xlab = "Samples", ylab = "log2 CPM",
+        las = 2, cex = 0.5, cex.lab = 1, dpi = 1000,
+        cex.axis = 0.25, sub = title)
+#draw the median on each box plot
+abline(h = median(apply(data, 2, median)),
+col = "green", lwd = 0.6, lty = "dashed")
+}
+
+dplot <- function(data, title) {
+  counts_density <- apply(log2(cpm(data+0.1)), 2, density)
+  #calculate the limits across all the samples
+  xlim <- 0; ylim <- 0
+  for (i in 1:length(counts_density)) {
+    xlim <- range(c(xlim, counts_density[[i]]$x));
+    ylim <- range(c(ylim, counts_density[[i]]$y))
+  }
+  cols <- rainbow(length(counts_density))
+  ltys <- rep(1, length(counts_density))
+  #plot the first density plot to initialize the plot
+  plot(counts_density[[1]], xlim=xlim, ylim=ylim, type="n",
+  ylab="Smoothing density of log2-CPM",
+  sub = title,
+  main="", cex.lab = 0.85)
+  #plot each line
+  for (i in 1:length(counts_density))
+    lines(counts_density[[i]], col=cols[i], lty=ltys[i])
+  #create legend
+  legend("topright", colnames(data),
+         col=cols, lty=ltys, cex = 0.15,
+         border ="blue", text.col = "green4",
+         merge = TRUE, bg = "gray90")
+}
+```
+
+## Non-CPM-Filtered, Non-Normalized Presentation
+
+First, let's visualize our data pre-normalization using both a violin plot and a density plot.
+
+```{r}
+bplot(pre_normalized_counts, "Figure 1: Log2 CPM for Non-CPM-Filtered, Non-Normalized Samples")
+dplot(pre_normalized_counts, "Figure 2: Log2 CPM for Non-CPM-Filtered, Non-Normalized Samples")
+```
+We only see a few potential outliers in the patient-derived samples, but those are subject to change upon filtering and normalization.
+
+## CPM Filtering
+
+Now, let's filter our data. Since the minimum number of samples for a cell line is 2, we have two as our min.
+
+```{r}
+#minimal number of samples
+min_num_samples <- 2
+pre_normalized_counts_matrix <- as.matrix(pre_normalized_counts)
+# get rid of low counts
+keep = rowSums(log2(cpm(pre_normalized_counts_matrix+0.1)) > 1) > min_num_samples
+filtered_counts_matrix = pre_normalized_counts_matrix[keep,]
+```
+
+Now, let's visualize.
+```{r}
+bplot(filtered_counts_matrix, "Figure 3: Log2 CPM for CPM-Filtered, Non-Normalized Samples")
+dplot(filtered_counts_matrix, "Figure 4: Log2 CPM for CPM-Filtered, Non-Normalized Samples")
+```
+
+## Normalization using TMM
+
+```{r}
+d <- DGEList(counts=filtered_counts_matrix)
+d <- calcNormFactors(d)
+normalized_counts <- cpm(d)
+```
+
+The changes can then be re-examined.
+```{r}
+bplot(normalized_counts, "Figure 5: Log2 CPM for CPM-Filtered, TMM-Normalized Samples")
+dplot(normalized_counts, "Figure 6: Log2 CPM for CPM-Filtered, TMM-Normalized Samples")
+```
+
+## MDS Analysis
+```{r warning = FALSE}
+par(xpd=T, mar=par()$mar+c(1.5,0,0,3))
+
+n_colours <- length(c(unique(sample_info_1$day), unique(sample_info_2$chamber)))
+palette <- sample(colorRampPalette(brewer.pal(n_colours, "RdYlBu"))(n_colours))
+
+limma::plotMDS(d, pch = 1, col = palette[factor(c(sample_info_1$day, sample_info_2$chamber))])
+
+mtext("Figure 7: MDS Showing Clustering of Patient Samples\nFrom Temporally Clustered Stem Cell-Derived CMs", side=1, line=5)
+
+legend("bottomright", 
+       legend=levels(factor(c(sample_info_1$day, sample_info_2$chamber))),
+       inset = c(-0.2,0),
+       pch=c(1), col=palette,title="Day/Chamber",
+       bty = 'n', cex = 0.75)
+
+par(mar=c(5, 4, 4, 2) + 0.1)
+```
+We can see that there is strong clustering of all the patient-derived samples, and there's also temporal clustering of all the stem cell-derived CMs. This is a little surprising, since one would've expected the day 60 cells to better approximate the rest of the patient LV samples, both tissue and isolated CM.
+
+## Dispersion
+
+```{r}
+d <- estimateDisp(d)
+```
+
+### Biological Coefficient of Variation
+
+```{r}
+plotBCV(d,col.tagwise = "black",col.common = "red", sub="Figure 8: Comparing BCV to the Average log CPM")
+```
+The BCV indicates that there is a high degree of variation in the dataset, suggesting that the dataset might show difficulty in trying ot find differentially expressed genes.
+
+### Mean Variance
+
+```{r}
+plotMeanVar(d, show.raw.vars = TRUE, show.tagwise.vars = TRUE,
+            NBline = TRUE, show.ave.raw.vars = TRUE,
+            show.binned.common.disp.vars = TRUE)
+mtext("Figure 9: Mean Variance Relationship Demonstrates that the data still follows a NB Distribution", side=1, line=5)
+
+```
+
+Since the data still follows a negative binomial distribution, it will still be suitable to analyze with edgeR in the next assignment. However, the high BCV values suggest that we will have some difficulties in finding differentially expressed genes.
+
+
+# Answering the Final Questions
+
+## What are the control and test conditions of the dataset?
+
+Answered
+
+## Why is the dataset of interest to you?
+
+Answered
+
+## Were there expression values that were not unique for specific genes? How did you handle these?
+
+After HGNC mapping, there were no non-unique values, and as such, were not dealt with.
+
+## Were there expression values that could not be mapped to current HUGO symbols?
+
+There were, these values were filtered out if they has `NA` values for the HGNC symbol.
+
+## How many outliers were removed?
+
+No outliers were removed, inline with the authors' original analysis.
+
+## How did you handle replicates?
+
+My dataset didn't contain any technical replicates, only biological ones (`heart_x`, `patient_y`), and as a result let them be.
+
+## What is the final coverage of your dataset?
+
+```{r}
+nrow(normalized_counts)/nrow(counts_data)
+```
+We thus have a final coverage of around 43.3%.
+
