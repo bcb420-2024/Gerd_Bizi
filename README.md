@@ -3,10 +3,11 @@
 Hello, my name is Gerd Bizi! I'm a fourth-year student studying Computer Science and Biochemistry.
 
 ### Wiki
-Link to Gerd Bizi's [Wiki](https://github.com/bcb420-2024/Gerd_Bizi/wiki)
+Link to Gerd Bizi's [Wiki](https://github.com/bcb420-2024/Gerd_Bizi/wiki), which contain homework, journal entries, and more!
 
-### A1
+### Assignments
 Link to Gerd Bizi's [A1](https://github.com/bcb420-2024/Gerd_Bizi/blob/main/a1/a1_updated.html)
+Link to Gerd Bizi's [A2](https://github.com/bcb420-2024/Gerd_Bizi/blob/main/a2/a2.html)
 
 [![CC BY 4.0][cc-by-shield]][cc-by]
 
