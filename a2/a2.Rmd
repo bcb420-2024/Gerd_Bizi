@@ -1,0 +1,1089 @@
+---
+title: "Assignment 2 - Differential Gene Expression and Preliminary ORA"
+author: "Gerd Bizi"
+date: "2024-03-15"
+fig_width: 10
+fig_height: 10
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+bibliography: a2_references.bib
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Background
+
+This is the second assignment for the BCB420H1 course \@ U of T.
+In this assignment, we will be parsing through our cleaned and normalized dataset generated in A1, and performing tests to identify differentially expressed genes and perform preliminary over-representation analyses.
+
+# Loading in Libraries
+
+First, let's load in all of our libraries.
+
+```{r, include=FALSE}
+if (! requireNamespace("GEOquery", quietly = TRUE)) {
+  BiocManager::install("GEOquery")
+}
+
+if (!requireNamespace("edgeR", quietly = TRUE)) {
+  install.packages("edgeR")
+}
+
+if (!requireNamespace("knitr", quietly = TRUE)) {
+  install.packages("knitr")
+}
+
+if (!requireNamespace("HGNC", quietly = TRUE)) {
+  install.packages("hgnc")
+}
+
+if (!requireNamespace("ggrepel", quietly = TRUE)) {
+    install.packages("ggrepel")
+}
+
+if (!requireNamespace("gprofiler2", quietly = TRUE)) {
+    install.packages("gprofiler2")
+}
+
+library(GEOquery)
+library(edgeR)
+library(knitr)
+library(httr)
+library(data.table)
+library(hgnc)
+library(RColorBrewer)
+library(ggplot2)
+library(pheatmap)
+library(dplyr)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(gprofiler2)
+library(tidyr)
+```
+
+# Assignment 1 Recap
+
+We are working with the [GSE205517](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE205517) dataset.
+This dataset and its accompanying study investigates the differentiation of hPSCs into left ventricular cardiomyocytes, and compares them to patient derived samples.
+[@cm_data] The study compares the transcriptomes of both conditions in order to determine similarity for potential therapeutic purposes.
+This study is a SuperSeries containing the SubSeries: - [GSE203375](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE203375), containing the hPSCs - [GSE204885](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE204885), containing the patient samples We will download both.
+In the previous assignment, we performed normalization on the RNA-Seq data, along with remapping HGNC symbols to avoid collisions.
+In this assignment, we will be perform differential gene expression (DGE) analysis, along with over-representation analysis (ORA).
+Before we begin these new steps, we will run the data acquisition, data overview, and normalization steps, and overview stats from assignment 1.
+
+## Data Acquisition
+
+First, let's perform our data acquisition step using GEOQuery. [@GEOquery]
+We'll be re-using code blocks from A1.
+
+```{r}
+# GEO Accession numbers
+geo_acc_1 <- "GSE203375"
+geo_acc_2 <- "GSE204885"
+
+# The filenames for saving/loading data
+filename_1 <- paste0(geo_acc_1, ".RData")
+filename_2 <- paste0(geo_acc_2, ".RData")
+
+# Reading in files from the GEO or locally
+if (!file.exists(filename_1)) {
+  gset_1 <- getGEO(geo_acc_1, GSEMatrix=TRUE, getGPL=FALSE)
+  saveRDS(gset_1, filename_1)
+} else {
+  gset_1 <- readRDS(filename_1)
+}
+gset_1 <- gset_1[[1]]
+
+if (!file.exists(filename_2)) {
+  gset_2 <- getGEO(geo_acc_2, GSEMatrix=TRUE, getGPL=FALSE)
+  saveRDS(gset_2, filename_2)
+} else {
+  gset_2 <- readRDS(filename_2)
+}
+gset_2 <- gset_2[[1]]
+```
+
+We now have our data loaded in.
+We now need to retrieve the counts tables from the GEO.
+
+```{r}
+# load counts table from GEO
+urld <- "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts"
+path_1 <- paste(urld, paste0("acc=", geo_acc_1), paste0("file=", geo_acc_1, "_raw_counts_GRCh38.p13_NCBI.tsv.gz"), sep="&");
+path_2 <- paste(urld, paste0("acc=", geo_acc_2), paste0("file=", geo_acc_2, "_raw_counts_GRCh38.p13_NCBI.tsv.gz"), sep="&");
+
+# This checks if we already have the previous matrices saved in or not. If we have a local copy, we don't re-download. This is a time-saving and efficiency measure.
+if (!file.exists(paste0(geo_acc_1,"_raw_counts.RData"))) {
+  counts_data_1 <- as.matrix(data.table::fread(path_1, header=T, colClasses="integer"), rownames=1)
+  name_mapping <- setNames(gset_1@phenoData@data[["title"]], gset_1@phenoData@data[["geo_accession"]])
+  colnames(counts_data_1) <- name_mapping[colnames(counts_data_1)]
+  saveRDS(counts_data_1, paste0(geo_acc_1, "_raw_counts.RData"))
+} else {
+  counts_data_1 <- readRDS(paste0(geo_acc_1, "_raw_counts.RData"))
+}
+
+# We do the same for our second dataset
+
+if (!file.exists(paste0(geo_acc_2,"_raw_counts.RData"))) {
+  counts_data_2 <- as.matrix(data.table::fread(path_2, header=T, colClasses="integer"), rownames=1)
+  name_mapping <- setNames(gset_2@phenoData@data[["title"]], gset_2@phenoData@data[["geo_accession"]])
+  colnames(counts_data_2) <- name_mapping[colnames(counts_data_2)]
+  saveRDS(counts_data_2, paste0(geo_acc_2, "_raw_counts.RData"))
+} else {
+  counts_data_2 <- readRDS(paste0(geo_acc_2, "_raw_counts.RData"))
+}
+counts_data <- cbind(counts_data_1, counts_data_2)
+```
+
+## Briefly Explaining our Data
+
+This excerpt is directly from A1: Some basic information about the dataset can be obtained through the ExpressionSet we've read in.
+The study investigated differentiation of two different cell lines, H9 of karyotype 46, XX, and MLC2V of karyotype 46, XY, corresponding to cells originating from female and male sources, respectively.
+It then compared to to patient samples harvested from left and right atrial and ventricular tissue, along with cardiomyocytes individually harvested from each section of the heart from three patients each.
+
+Below are the experimental details provided in the gset objects for both series:
+
+```{r}
+gset_1@experimentData@title # study title
+gset_1@experimentData@abstract # study abstract
+gset_1@experimentData@other$overall_design # summary of experiment
+unique(gset_1@phenoData@data[["extract_protocol_ch1.1"]]) # platform
+
+unique(gset_1@phenoData@data[["experiment number:ch1"]]) # heart
+unique(gset_1@phenoData@data[["cell_line:ch1"]]) # cell lines
+unique(gset_1@phenoData@data[["day:ch1"]]) # day of differentiation
+
+gset_1@experimentData@other$platform_id # GPL id
+gset_1@experimentData@other$last_update_date # last update date
+unique(gset_1@phenoData@data$organism_ch1) # organism
+```
+
+```{r}
+gset_2@experimentData@title # study title
+gset_2@experimentData@abstract # study abstract
+gset_2@experimentData@other$overall_design # summary of experiment
+unique(gset_2@phenoData@data[["extract_protocol_ch1.1"]]) # platform
+
+unique(gset_2@phenoData@data[["chamber:ch1"]]) # cell lines
+unique(gset_2@phenoData@data[["patient:ch1"]]) # patient
+unique(gset_2@phenoData@data[["tissue:ch1"]]) # tissue
+
+gset_2@experimentData@other$platform_id # GPL id
+gset_2@experimentData@other$last_update_date # last update date
+unique(gset_2@phenoData@data$organism_ch1) # organism
+```
+
+```{r}
+sample_info_1 <- gset_1@phenoData@data[ , (ncol(gset_1@phenoData@data)-2):ncol(gset_1@phenoData@data)]
+colnames(sample_info_1) <- gsub(":ch1", "", colnames(sample_info_1)) 
+knitr::kable(sample_info_1, format = "pipe", caption = "<b>Table 1:</b> Sample information for Cardiomyocytes Derived from Stem Cells")
+```
+
+```{r}
+sample_info_2 <- gset_2@phenoData@data[ , (ncol(gset_2@phenoData@data)-2):ncol(gset_2@phenoData@data)]
+colnames(sample_info_2) <- gsub(":ch1", "", colnames(sample_info_2)) 
+knitr::kable(sample_info_2, format = "pipe", caption = "<b>Table 2:</b> Sample information for Patient-Derived Samples")
+```
+
+## Data-Cleaning
+
+To clean our data, we will do two things: 1.
+Filter out zero-expressors 2.
+Perform HGNC re-mapping 3.
+Normalize the data
+
+### Filtering Out Zero-Expressors
+
+From A1, we know that there are genes that minimally express throughout different conditions, and as a result, we will be filtering those out.
+
+```{r}
+# Pick out all rows that have zeroes across all conditions
+rows_to_keep <- apply(counts_data, 1, function(row) any(row != 0))
+
+# Create new matrix containing only the rows that aren't all zeroes
+counts_data_zero_filtered <- counts_data[rows_to_keep, ]
+```
+
+### Data Normalization
+
+In line with the experimenters' analyses, we will normalize the data together
+
+First, let's perform CPM filtering to remove low expressors.
+
+```{r}
+# Minimum number of samples for the hPSC run
+min_num_samples <- 2
+counts_data_zero_filtered_matrix <- as.matrix(counts_data_zero_filtered)
+
+# Get rid of low counts
+# We add 0.1 for numerical stability and to prevent NA values when evaluating logs
+keep = rowSums(log2(cpm(counts_data_zero_filtered_matrix+0.1)) > 1) > min_num_samples
+filtered_counts_matrix = counts_data_zero_filtered_matrix[keep,]
+```
+
+After, we will use TMM from edgeR [@edgeR] to perform our normalization steps.
+
+```{r}
+# We will make our DGEList with the filtered count matrices
+d <- DGEList(counts=filtered_counts_matrix)
+
+# Calculate normalization factors
+d <- calcNormFactors(d)
+
+# Apply normalization
+normalized_counts <- cpm(d)
+```
+
+Normalization is now done, and we can move onto HGNC mapping.
+
+### HGNC Mapping
+
+The protocol followed for HGNC mapping is nearly identical to the first assignment.
+First, we will add a column to our normalized with the appropriate NCBI gene ID.
+While we do have the annotation table, it is also true that we were specified to still manually perform this step.
+We will download a copy of the HGNC dataset. [@HGNC]
+The dataset is confirmed to be up-to-date with the date of download.
+
+```{r}
+# Download the HGNC file if it doesn't already exist in the cwd
+if (!file.exists("hgnc_genes.RData")) {
+  hgnc_genes <- import_hgnc_dataset(file=latest_archive_url())
+  saveRDS(hgnc_genes, "hgnc_genes.RData")
+} else {
+  hgnc_genes <- readRDS("hgnc_genes.RData")
+}
+hgnc_mapping <- hgnc_genes[, c('symbol', 'entrez_id')]
+```
+
+Now that we have a mapping, we can apply this to the table.
+
+```{r}
+# Convert the normalized counts into a dataframe
+normalized_counts_df <- as.data.frame(normalized_counts)
+
+# Add rownames
+normalized_counts_df$NCBI_gene_id <- rownames(normalized_counts_df)
+
+# Map the entrez_id to the NCBI_gnes
+labelled_counts_data <- merge(normalized_counts_df, hgnc_mapping, by.x = "NCBI_gene_id", by.y = 'entrez_id', all.x = TRUE)
+labelled_counts_data <- labelled_counts_data[,c(1, ncol(labelled_counts_data), 3:ncol(labelled_counts_data)-1)]
+
+knitr::kable(labelled_counts_data[c(1:10), c(1,2)], format = "pipe", caption = "<b>Table 3:</b> Table Matching First 10 NCBI Gene IDs to the Approved HGNC Symbols")
+
+labelled_counts_data <- labelled_counts_data[, -c(1)]
+```
+
+Now, we must deal with `NA` and empty values, along with many-to-one mappings.
+
+```{r}
+# Remove all NA labels
+no_na_labelled_counts_data <- labelled_counts_data[!is.na(labelled_counts_data$symbol), ]
+
+# Remove all empty strings symbols
+no_emp_labelled_counts_data <- no_na_labelled_counts_data[no_na_labelled_counts_data$symbol != '', ]
+
+rownames(no_emp_labelled_counts_data) <- no_emp_labelled_counts_data[, 1]
+final_normalized_data <- no_emp_labelled_counts_data[, -c(1)]
+```
+
+## Overview Statistics
+
+Now that we have our data, we can look at a few counting statistics to gain insight into what we're looking at.
+
+```{r}
+# Create a list of overview stats
+overview_stats <- list()
+
+# Do it for each sample
+for (sample_name in colnames(final_normalized_data)) {
+  sample_data <- final_normalized_data[, sample_name]
+  
+  total_counts <- sum(sample_data)
+  mean_counts <- mean(sample_data)
+  median_counts <- median(sample_data)
+  sd_counts <- sd(sample_data)
+  var_counts <- var(sample_data)
+  overview_stats[[sample_name]] <- c(total_counts, mean_counts, median_counts, sd_counts, var_counts)
+}
+
+overview_stats_df <- do.call(rbind, overview_stats)
+rownames(overview_stats_df) <- names(overview_stats)
+colnames(overview_stats_df) <- c("Total Counts", "Mean Counts", "Median Counts", "Counts Standard Deviation", "Counts Variation")
+
+knitr::kable(overview_stats_df[, ], format = "pipe", caption = "<b>Table 4:</b> Overview Statistics of Normalized Samples. The total counts are somewhat similar, but the mean counts are lower in the hPSC-derived samples. Mean counts are somewhat similar in both, but the median counts are greater in the hPSCs. The standard deviation and variation in the hPSCs is far lesser than that of the patient samples.")
+```
+
+## MDS Plots
+
+We will now use MDS plots, which involve using dimensional reduction techniques to observe clustering of our samples. [@Ritchie2015-fj]
+
+```{r warning=FALSE}
+par(xpd=T, mar=par()$mar+c(1.5,0,0,3))
+
+# Manually specify the order of the conditions
+ordered_conditions <- c("0", "2", "4", "6", "10", "15", "20", "40", "60", "LA", "LV", "RA", "RV")
+
+# Create a factor with the specified order
+conditions_factor <- factor(c(sample_info_1$day, sample_info_2$chamber), levels = ordered_conditions)
+
+# Generate a color palette with the same number of colors as the number of conditions
+n_colours <- length(ordered_conditions)
+palette <- rainbow(n_colours)
+
+# Plot the MDS with the ordered conditions and corresponding colors
+limma::plotMDS(d, pch = 1, col = palette[conditions_factor])
+
+# Add a title and legend
+mtext("Figure 1: MDS Showing Clustering of Patient Samples\nFrom Temporally Clustered hPSC-Derived CMs", side=1, line=5)
+legend("bottomright", 
+       legend = ordered_conditions,
+       inset = c(-0.2, 0),
+       pch = c(1), col = palette, title = "Day/Chamber",
+       bty = 'n', cex = 0.75)
+
+par(mar=c(5, 4, 4, 2) + 0.1)
+```
+
+We can see that there is strong clustering of all the patient-derived samples, and there's also temporal clustering of all the stem cell-derived CMs.
+This is evidenced by the fact the from left to right, we see a 'continuous' clustering of cardiomyocytes from d60 to d0.
+We see that the patient samples all cluster together quite strongly, but further away in the firsta and second dimensions. This can likely be explained due to higher variance and low median counts in the patient data, but the fact that the cells came from warm cadavers, and the cell niche
+The range for the MDS Leading logFC dimensions are also quite high, which could be explained due to having two different types of data here.
+
+# Differential Gene Expression
+
+We will now prefer differential gene expression analyses.
+Based on the results of the previously generated MDS plots, I think that important analyses would be:
+* Pairwise comparisons between each time point of the hPSC to cardiomyocyte differentiation
+    + Specifically a comparison between day 0 and day 60 of the stem cell experiments - Comparison of the day 60
+* hPSC-cardiomyocyte to the rest of the patient heart cells
+
+## Determining p-Values
+
+We will determine the p-values of each of the experiment using edgeR. [@edgeR]
+
+```{r}
+# 1. Prepare the data
+
+# Truncate the sample names
+converted_names <- gsub("Heart \\d+ Day (\\d+) .*", "day \\1", colnames(final_normalized_data))
+converted_names <- gsub("Patient \\d+ (Left|Right) (Ventricle|Atria) .*", "\\1 \\2", converted_names)
+converted_names <- gsub(" ", "", converted_names)
+```
+
+```{r}
+# Create a data frame with sample information
+samples <- data.frame(converted_names)
+
+# Convert the count data to a DGEList object
+dge <- DGEList(counts = final_normalized_data)
+
+# 2. Create the design matrix
+# Create the design matrix with only 'day' as a factor
+design <- model.matrix(~0 + factor(samples$converted_names))
+
+# Rename the columns to be more interpretable
+colnames(design) <- gsub("factor\\(samples\\$converted_names\\)", "", colnames(design))
+
+dge <- estimateDisp(dge, design)
+
+# 4. Fit the model
+fit <- glmQLFit(dge, design)
+```
+
+Now, we will create the contrast matrices for comparisons.
+
+```{r}
+# 5. Create contrast matrices
+twoVS0con <- makeContrasts(
+    day2vsday0 = day2 - day0,
+    levels = design
+)
+fourVS2con <- makeContrasts(
+    day4vsday2 = day4 - day2,
+    levels = design
+)
+sixVS4con <- makeContrasts(
+    day6vsday4 = day6 - day4,
+    levels = design
+)
+tenVS6con <- makeContrasts(
+    day10vsday6 = day10 - day6,
+    levels = design
+)
+fifteenVS10con <- makeContrasts(
+    day15vsday10 = day15 - day10,
+    levels = design
+)
+twentyVS15con <- makeContrasts(
+    day20vsday15 = day20 - day15,
+    levels = design
+)
+fortyVS20con <- makeContrasts(
+    day40vsday20 = day40 - day20,
+    levels = design
+)
+sixtyVS40con <- makeContrasts(
+    day60vsday40 = day60 - day40,
+    levels = design
+)
+sixtyVS0con <- makeContrasts(
+    day60vsday0 = day60 - day0,
+    levels = design
+)
+lvVS60 <- makeContrasts(
+    LVvsday0 = LeftVentricle - day60,
+    levels = design
+)
+rvVS60 <- makeContrasts(
+    RVvsday60 = RightVentricle - day60,
+    levels = design
+)
+laVS60 <- makeContrasts(
+    LAvsday60 = LeftAtria - day60,
+    levels = design
+)
+raVS60 <- makeContrasts(
+    RAvsday60 = RightAtria - day60,
+    levels = design
+)
+lvVSrv <- makeContrasts(
+    lvvsrv = LeftVentricle - RightVentricle,
+    levels = design
+)
+```
+
+Now, we can find differential expression between conditions
+
+```{r}
+# 6. Perform the tests
+twoVS0_lrt <- glmQLFTest(fit, contrast = twoVS0con)
+fourVS2_lrt <- glmQLFTest(fit, contrast = fourVS2con)
+sixVS4_lrt <- glmQLFTest(fit, contrast = sixVS4con)
+tenVS6_lrt <- glmQLFTest(fit, contrast = tenVS6con)
+fifteenVS10_lrt <- glmQLFTest(fit, contrast = fifteenVS10con)
+twentyVS15_lrt <- glmQLFTest(fit, contrast = twentyVS15con)
+fortyVS20_lrt <- glmQLFTest(fit, contrast = fortyVS20con)
+sixtyVS40_lrt <- glmQLFTest(fit, contrast = sixtyVS40con)
+sixtyVS0_lrt <- glmQLFTest(fit, contrast = sixtyVS0con)
+lvVS60_lrt <- glmQLFTest(fit, contrast = lvVS60)
+rvVS60_lrt <- glmQLFTest(fit, contrast = rvVS60)
+laVS60_lrt <- glmQLFTest(fit, contrast = laVS60)
+raVS60_lrt <- glmQLFTest(fit, contrast = raVS60)
+lvVSrv_lrt <- glmQLFTest(fit, contrast = lvVSrv)
+
+# 7. Extract results
+results_twoVS0 <- topTags(twoVS0_lrt, sort.by = "PValue", n = nrow(final_normalized_data), adjust.method = "BH")
+results_fourVS2 <- topTags(fourVS2_lrt, sort.by = "PValue", n = nrow(final_normalized_data), adjust.method = "BH")
+results_sixVS4 <- topTags(sixVS4_lrt, sort.by = "PValue", n = nrow(final_normalized_data), adjust.method = "BH")
+results_tenVS6 <- topTags(tenVS6_lrt, sort.by = "PValue", n = nrow(final_normalized_data), adjust.method = "BH")
+results_fifteenVS10 <- topTags(fifteenVS10_lrt, sort.by = "PValue", n = nrow(final_normalized_data), adjust.method = "BH")
+results_twentyVS15 <- topTags(twentyVS15_lrt, sort.by = "PValue", n = nrow(final_normalized_data), adjust.method = "BH")
+results_fortyVS20 <- topTags(fortyVS20_lrt, sort.by = "PValue", n = nrow(final_normalized_data), adjust.method = "BH")
+results_sixtyVS40 <- topTags(sixtyVS40_lrt, sort.by = "PValue", n = nrow(final_normalized_data), adjust.method = "BH")
+results_sixtyVS0 <- topTags(sixtyVS0_lrt, sort.by = "PValue", n = nrow(final_normalized_data), adjust.method = "BH")
+results_lvVS60 <- topTags(lvVS60_lrt, sort.by = "PValue", n = nrow(final_normalized_data), adjust.method = "BH")
+results_rvVS60 <- topTags(rvVS60_lrt, sort.by = "PValue", n = nrow(final_normalized_data), adjust.method = "BH")
+results_laVS60 <- topTags(laVS60_lrt, sort.by = "PValue", n = nrow(final_normalized_data), adjust.method = "BH")
+results_raVS60 <- topTags(raVS60_lrt, sort.by = "PValue", n = nrow(final_normalized_data), adjust.method = "BH")
+results_lvVSrv <- topTags(lvVSrv_lrt, sort.by = "PValue", n = nrow(final_normalized_data), adjust.method = "BH")
+```
+
+I chose to use a cut-off of 0.01, in-line with the original study, and the limit the amount of genes that show up as significant, as there is a lot of temporal variation in stem cell differentiation protocols. In terms of the multiple hypothesis correction, I chose to use Benjamini-Hochberg for its robustness and that it seems quite standard in such analyses.
+
+We will now present summary data in a table for each comparison.
+
+```{r}
+summary_table <- data.frame(
+  Comparison = c("Day 2 VS Day 0",
+                 "Day 4 VS Day 2",
+                 "Day 6 VS Day 4",
+                 "Day 10 VS Day 6",
+                 "Day 15 VS Day 10",
+                 "Day 20 VS Day 15",
+                 "Day 40 VS Day 20",
+                 "Day 60 VS Day 40",
+                 "Day 60 VS Day 0",
+                 "LV VS Day 60",
+                 "RV VS Day 60",
+                 "LA VS Day 60",
+                 "RA VS Day 60",
+                 "LV VS RV"
+                 ),
+  Significant = c(length(which(results_twoVS0$table$PValue < 0.01)),
+                  length(which(results_fourVS2$table$PValue < 0.01)),
+                  length(which(results_sixVS4$table$PValue < 0.01)),
+                  length(which(results_tenVS6$table$PValue < 0.01)),
+                  length(which(results_fifteenVS10$table$Value < 0.01)),
+                  length(which(results_twentyVS15$table$PValue < 0.01)),
+                  length(which(results_fortyVS20$table$PValue < 0.01)),
+                  length(which(results_sixtyVS40$table$PValue < 0.01)),
+                  length(which(results_sixtyVS0$table$PValue < 0.01)),
+                  length(which(results_lvVS60$table$PValue < 0.01)),
+                  length(which(results_rvVS60$table$PValue < 0.01)),
+                  length(which(results_laVS60$table$PValue < 0.01)),
+                  length(which(results_raVS60$table$PValue < 0.01)),
+                  length(which(results_lvVSrv$table$PValue < 0.01))
+                  ),
+  Corrected = c(length(which(results_twoVS0$table$FDR < 0.01)),
+                length(which(results_fourVS2$table$FDR < 0.01)),
+                length(which(results_sixVS4$table$FDR < 0.01)),
+                length(which(results_tenVS6$table$FDR < 0.01)),
+                length(which(results_fifteenVS10$table$FDR < 0.01)),
+                length(which(results_twentyVS15$table$FDR < 0.01)),
+                length(which(results_fortyVS20$table$FDR < 0.01)),
+                length(which(results_sixtyVS40$table$FDR < 0.01)),
+                length(which(results_sixtyVS0$table$FDR < 0.01)),
+                length(which(results_lvVS60$table$FDR < 0.01)),
+                length(which(results_rvVS60$table$FDR < 0.01)),
+                length(which(results_laVS60$table$FDR < 0.01)),
+                length(which(results_raVS60$table$FDR < 0.01)),
+                length(which(results_lvVSrv$table$FDR < 0.01))
+                )
+)
+
+kable(summary_table, caption = "Table 5: The number of genes that show the number of significantly differentially expressed genes before and after FDR correction. For the temporal analysis, the first two comparisons hover around 1800 genes, the next two are at around 900, and then there's a steep drop off at the day 15 vs 10 and day 20 vs 15 comparisons. This picks back up. This picks back up intil days 60 to 40, showing minimal change, suggesting that they're in late stage maturation. Between day 60 and patient samples, many genes, all above 6000, are significantly differentially expressed. Between ventricles, no change is observed. ")
+```
+
+As expected, the comparison with the greatest number of differentially expressed genes was between day 60 and day 0, which compares an hPSC to a left ventricular cardiomyocyte derived from stem cells.
+Interestingly, we see a very small amount of differentially expressed genes for day 15 vs day 10 and day 60 and day 40.
+In terms of the patient sample comparisons, we see that all of them have a great number of genes with a significant values of differential expression, which indicates that even the mature hPSC-derived CM is very far from the patient by transcriptome.
+This could be explained due to the niche of the cell--cardiomyocytes in vivo are constantly beating, working to pump blood, and are also surrounded by other tissue types which secrete signals to regulate expression of different transcripts.
+In a dish, this isn't the case, which could explain this phenomenon.
+We can investigate this more closely once we see which genes come out as top hits.
+
+We will save our results in a list for ease of downstream analysis.
+
+```{r}
+# List of all the results objects
+results_list <- list(
+  results_twoVS0 = results_twoVS0,
+  results_fourVS2 = results_fourVS2,
+  results_sixVS4 = results_sixVS4,
+  results_tenVS6 = results_tenVS6,
+  results_fifteenVS10 = results_fifteenVS10,
+  results_twentyVS15 = results_twentyVS15,
+  results_fortyVS20 = results_fortyVS20,
+  results_sixtyVS40 = results_sixtyVS40,
+  results_sixtyVS0 = results_sixtyVS0,
+  results_lvVS60 = results_lvVS60,
+  results_rvVS60 = results_rvVS60,
+  results_laVS60 = results_laVS60,
+  results_raVS60 = results_raVS60,
+  results_lvVSrv = results_lvVSrv
+)
+
+# Titles for each plot
+titles <- c(
+  "Day 2 vs Day 0",
+  "Day 4 vs Day 2",
+  "Day 6 vs Day 4",
+  "Day 10 vs Day 6",
+  "Day 15 vs Day 10",
+  "Day 20 vs Day 15",
+  "Day 40 vs Day 20",
+  "Day 60 vs Day 40",
+  "Day 60 vs Day 0",
+  "LV vs Day 60",
+  "RV vs Day 60",
+  "LA vs Day 60",
+  "RA vs Day 60",
+  "LV vs RV"
+)
+```
+
+## Volcano Plots
+
+We will use volcano plots to show differentially expressed genes.
+To do this efficiently, we will make a function for making volcano plot.
+To determine top hits, we will filter by having an FDR of less that 0.01, and having an absolute logFC value of 2. This is in line with the paper's protocol.
+
+```{r}
+create_volcano_plot <- function(data, title, logFC_threshold = 2, FDR_threshold = 0.01, top_n = 5) {
+  # Add gene names as a column
+  data$Gene <- rownames(data)
+
+  # Add a column to indicate the direction of regulation
+  data$direction <- with(data, ifelse(logFC > logFC_threshold & FDR < FDR_threshold, "Upregulated",
+                                      ifelse(logFC < -logFC_threshold & FDR < FDR_threshold, "Downregulated", "Neutral")))
+  
+  # Select top genes based on FDR and absolute logFC
+  top_genes <- data %>%
+    filter(direction %in% c("Upregulated", "Downregulated")) %>%
+    arrange(FDR, abs(logFC)) %>%
+    group_by(direction) %>%
+    slice_head(n = top_n) %>%
+    ungroup()
+  
+  # Create the volcano plot
+  volcano_plot <- ggplot(data, aes(x = logFC, y = -log10(FDR), color = direction)) +  
+    geom_point(alpha = 0.5) + 
+    theme_minimal() +
+    labs(title = title, x = "Log Fold Change", y = "-log10(FDR)") +
+    scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "blue", "Neutral" = "grey")) +
+    theme(legend.title = element_blank()) +
+    geom_vline(xintercept = c(-logFC_threshold, logFC_threshold), linetype = "dashed", color = "black") +
+    geom_hline(yintercept = -log10(FDR_threshold), linetype = "dashed", color = "black") +
+    geom_text_repel(data = top_genes, aes(label = Gene), size = 3, nudge_y = 1) 
+  
+  return(volcano_plot)
+}
+```
+
+Now, let's plot
+
+```{r}
+# Create a plot for each comparison
+plots <- lapply(seq_along(results_list), function(i) {
+  create_volcano_plot(results_list[[i]]$table, titles[i])
+})
+
+# Display the plots
+for (i in seq_along(plots)) {
+  print(plots[[i]])
+}
+```
+
+Figure 2: Volcano plots for all comparisons. All are displayed for breadth of analysis. The top hits are also displayed. The interpretation for these results is discussed in the table heading for Table 5 and after.
+
+## Filtering for Top Hits
+
+We will now filter with the same parameters used to filter in the volcano plots.
+
+```{r}
+# Filter each comparison based on the specified criteria
+filtered_results_list <- lapply(results_list, function(result) {
+  result$table %>%
+    filter(FDR < 0.01, abs(logFC) > 2)
+})
+
+# Names for the filtered results
+names(filtered_results_list) <- names(results_list)
+
+filtered_results_display_df <- data.frame(
+  Num_Genes = sapply(filtered_results_list, nrow)
+)
+
+kable(filtered_results_display_df, caption = "Table 6: Number of genes meeting criteria for each comparison. Notice that because of the logFC conition, all values are necessarily equal to or smaller than the values in Table 5.")
+```
+
+## Filtering for All and Unique Differentially Expressed Genes
+
+```{r}
+# Extract gene names from each filtered result and combine them into a single vector
+union_gene_names <- unlist(lapply(filtered_results_list, function(filtered_result) {
+  rownames(filtered_result)
+}))
+
+# Remove duplicate gene names
+all_genes <- unique(union_gene_names)
+```
+
+We will also need single genes for downstream analysis.
+
+```{r}
+# Get only the unique genes for downstream analysis
+gene_counts <- table(union_gene_names)
+unique_genes <- names(gene_counts[gene_counts == 1])
+```
+
+## Heat Map
+
+We will now present our analysis, and specifically clustering of samples using a heatmap by using the Complex HeatMap library. [@Gu2022-fo]
+
+```{r}
+# Subset the normalized count matrix to keep only the genes of interest, ensure no NAs
+heatmap_data <- final_normalized_data[all_genes, , drop = FALSE]
+heatmap_data <- heatmap_data[complete.cases(heatmap_data), ]
+
+# Scale the expression data
+scaled_heatmap_data <- t(scale(t(heatmap_data)))
+
+# Order the converted_names
+ordered_converted_names <- unique(converted_names)
+day6element <- ordered_converted_names[9]
+ordered_converted_names <- ordered_converted_names[-9]
+ordered_converted_names <- append(ordered_converted_names, day6element, after=3)
+
+# Generate a color vector for conditions, using rainbow and setting the names attribute
+condition_colors <- setNames(rainbow(length(ordered_converted_names)), ordered_converted_names)
+
+# Create annotations for the heatmap
+annotations_df <- data.frame(Condition = factor(converted_names, levels = ordered_converted_names))
+
+# Create annotations for the heatmap
+heatmap_annotations <- HeatmapAnnotation(Condition = annotations_df$Condition, col = list(Condition = condition_colors), show_legend = TRUE)
+
+# Generate the heatmap
+heatmap <- Heatmap(
+  as.matrix(scaled_heatmap_data),
+  top_annotation = heatmap_annotations,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE, # Turn off column clustering to maintain the order of days and conditions
+  col = colorRamp2(c(-2, 0, 4), c("darkgreen", "white", "darkmagenta")), # Adjust colors as needed
+  show_column_names = FALSE, # Turn on to see the order of columns
+  show_row_names = FALSE,
+  show_heatmap_legend = TRUE,
+  column_title = "Figure 3: Gene Expression of all Significantly Differentially Expressed Genes"
+)
+
+# Draw the heatmap
+draw(heatmap)
+```
+
+The conditions cluster somewhat well, but out of order temporally. This may be because many genes may be up and down-regulated during differentiation, and as a result, a gene coming on-off-on or vice-versa may result in different timepoint clustering together exclusively through transcriptomes and not temporally. Interestingly, the patient samples cluster well together as expected, but they are adjacent to day 6, which is unusual. My best explanation may be because of variance, but I will try to better cluster these using unique genes for each condition instead. By doing this, we get rid of genes that are significant more than once. This way, the genes act as better 'signatures' of each condition.
+
+```{r}
+# Subset the normalized count matrix to keep only the genes of interest, ensure no NAs
+unique_heatmap_data <- final_normalized_data[unique_genes, , drop = FALSE]
+unique_heatmap_data <- unique_heatmap_data[complete.cases(unique_heatmap_data), ]
+
+# Scale the expression data
+unqiue_scaled_heatmap_data <- t(scale(t(unique_heatmap_data)))
+
+# Generate the heatmap
+unique_heatmap <- Heatmap(
+  as.matrix(unqiue_scaled_heatmap_data),
+  top_annotation = heatmap_annotations,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE, # Turn off column clustering to maintain the order of days and conditions
+  col = colorRamp2(c(-2, 0, 4), c("darkgreen", "white", "darkmagenta")), # Adjust colors as needed
+  show_column_names = FALSE, # Turn on to see the order of columns
+  show_row_names = FALSE,
+  show_heatmap_legend = TRUE,
+  column_title = "Figure 4: Gene Expression of Unique Significantly Differentially Expressed Genes"
+)
+
+# Draw the heatmap
+draw(unique_heatmap)
+```
+This time, we better clustering, and 'colour-blocking' in the matrix itself. Once again, the patient samples are sandwiched between days 6 and 10. This may be because the normalization technique used may not have been as appropriate for such analysis, and significant noise may be in samples.
+In the future, I may incorporate a library like noisyR [@noisyR]
+
+# Over-Representation Analysis
+
+## Defining Up and Down-Regulated Gene Sets
+
+Here, we will define up and down-regulated gene sets.
+The goal of this function block was to create a general overall list of genes that were up and down-regulated for each condition, and to create a pooled one as well.
+In terms of significance values, we'll use a cut-off of FDR \< 0.05 and the magnitude of logFC being 0.
+These are the same parameters the authors used in their analysis.
+
+```{r}
+ora_filtered_results_list <- lapply(results_list, function(result) {
+  result$table %>%
+    filter(FDR < 0.05)
+})
+
+up_regulated_results_list <- lapply(ora_filtered_results_list, function(result) {
+  result %>%
+    filter(logFC > 0)
+})
+
+up_regulated_results_list <- lapply(up_regulated_results_list, function(result) {
+  rownames(result)
+})
+
+down_regulated_results_list <- lapply(ora_filtered_results_list, function(result) {
+  result %>%
+    filter(logFC < 0)
+})
+
+down_regulated_results_list <- lapply(down_regulated_results_list, function(result) {
+  rownames(result)
+})
+
+all_up_regulated_genes <- unique(unlist(up_regulated_results_list))
+all_down_regulated_genes <- unique(unlist(down_regulated_results_list))
+```
+
+## Setting up the g:Profiler
+
+Let's set up the g:Profiler for all of the aforementioned combinations (per condition, for significant, up and down-regulated genes). [@gpro] We will be using the g:Profiler since it's a popular and robust tool for ORA, and it was also a technique learned in a previous homework assignment.
+The paper only uses the GO BP annotation dataset, and we will be doing the same.
+This dataset ...
+
+```{r}
+go_upreg <- gost(
+  query = all_up_regulated_genes, 
+  organism = "hsapiens", 
+  sources = c("GO:BP")
+  )
+
+go_downreg <- gost(
+  query = all_down_regulated_genes, 
+  organism = "hsapiens", 
+  sources = c("GO:BP")
+  )
+
+go_updownreg <- gost(
+  query = list(Downregulated = all_down_regulated_genes, Upregulated = all_up_regulated_genes), 
+  organism = "hsapiens", 
+  sources = c("GO:BP")
+  )
+```
+
+## Analyzing All Up and Down-Regulated Genes, Pooled
+
+Let's look at the results of these:
+
+```{r}
+numerical_go_summary_df <- data.frame(
+  Analysis <- c("Up and Down-Regulated", "Up-Regulated", "Down-Regulated"),
+  Pathways <- c(
+    nrow(go_updownreg$result),
+    nrow(go_upreg$result),
+    nrow(go_downreg$result)
+  )
+)
+
+kable(numerical_go_summary_df, col.names = c("Analysis", "Number of Pathways"), caption = "Table 7: The number of pathways that are up/down-regulated for each condition, and when they're pooled together. Notice that the the when analyzed together, the number of pathways are the sum of te individual conditions.")
+```
+
+We can see that running the analysis together or separately still yields the same number of total pathways being recognized.
+
+Let's look at a few up-regulated terms.
+
+We will filter pathways with greater than 1000 terms, since they could be 'ubiquitous' and yield false positives. Start with up-regulation.
+
+```{r}
+filtered_go_upreg <- go_updownreg$result[
+  which(go_updownreg$result$query == "Upregulated" & go_updownreg$result$term_size <= 1000 ),]
+
+kable(filtered_go_upreg[1:10, c(11, 3, 1)],
+      caption = "Table 8: Top 10 upregulated pathways. The BH values show up as zero since they are so small.",
+      col.names = c("Pathway", "P Value (BH)","Direction")
+      )
+```
+
+And now down-regulation.
+
+```{r}
+filtered_go_downreg <- go_updownreg$result[
+  which(go_updownreg$result$query == "Downregulated" & go_updownreg$result$term_size <= 1000 ),]
+
+kable(filtered_go_downreg[1:10, c(11, 3, 1)],
+      caption = "Table 9: Top 10 downregulated pathways. The BH values show up as zero since they are so small.",
+      col.names = c("Pathway", "P Value (BH)","Direction")
+      )
+```
+
+## Analyzing for Pairwise Comparisons
+
+We will extract up and down-regualted genes using the same conditions for all conditions.
+
+```{r}
+# Initialize lists to hold the gene sets
+upregulated_genesets <- list()
+downregulated_genesets <- list()
+
+# Iterate over the filtered results list
+for (condition_name in names(ora_filtered_results_list)) {
+  # Extract the data frame for the condition
+  condition_df <- ora_filtered_results_list[[condition_name]]
+  
+  # Filter for upregulated genes (FDR < 0.05 and logFC > 0)
+  upregulated_genes <- condition_df %>% 
+    filter(FDR < 0.05, logFC > 0) %>% 
+    rownames()
+  
+  # Filter for downregulated genes (FDR < 0.05 and logFC < 0)
+  downregulated_genes <- condition_df %>% 
+    filter(FDR < 0.05, logFC < 0) %>% 
+    rownames()
+  
+  # Add to the lists
+  upregulated_genesets[[condition_name]] <- upregulated_genes
+  downregulated_genesets[[condition_name]] <- downregulated_genes
+}
+```
+
+First, we'll look at the temporal comparisons.
+
+```{r warning=FALSE}
+# Initialize an empty list to hold the GO analysis for each comparison
+days_analysis_list <- vector("list", 9)
+
+# Iterate over each comparison
+for (i in 1:9) {
+  cond <- names(ora_filtered_results_list)[i]
+  # Perform g:Profiler analysis for upregulated and downregulated genes separately
+  go_analysis <- gost(
+    query = list(Downregulated = downregulated_genesets[[cond]],
+                 Upregulated = upregulated_genesets[[cond]]),
+    organism = "hsapiens",
+    sources = c("GO:BP")
+  )
+  
+  # Add the results to the list
+  days_analysis_list[[cond]] <- go_analysis
+}
+
+# Remove the first 9 empty entries
+days_analysis_list <- days_analysis_list[-(1:9)]
+```
+
+And now the patient ones.
+
+```{r warning=FALSE}
+# Initialize an empty list to hold the GO analysis for each comparison
+patient_analysis_list <- vector("list", 4)
+
+# Iterate over each comparison
+for (i in 10:13) {
+  cond <- names(ora_filtered_results_list)[i]
+  # Perform g:Profiler analysis for upregulated and downregulated genes separately
+  go_analysis <- gost(
+    query = list(Downregulated = downregulated_genesets[[cond]],
+                 Upregulated = upregulated_genesets[[cond]]),
+    organism = "hsapiens",
+    sources = c("GO:BP")
+  )
+  
+  # Add the results to the list
+  patient_analysis_list[[cond]] <- go_analysis
+}
+
+# Remove the first 4 empty entries
+patient_analysis_list <- patient_analysis_list[-(1:4)]
+```
+
+We will now display both.
+
+```{r}
+# Initialize an empty data frame to hold the top pathways for each condition and direction
+top_pathways_df <- data.frame(matrix(ncol = length(names(days_analysis_list)) * 2, nrow = 10))
+
+# Set the column names for the data frame
+colnames(top_pathways_df) <- paste(rep(names(days_analysis_list), each = 2), rep(c("Upregulated", "Downregulated"), times = length(names(days_analysis_list))), sep = "_")
+
+# Fill the data frame with the top pathways
+for (cond in names(days_analysis_list)) {
+  # Extract the top 10 upregulated pathways
+  top_upreg <- days_analysis_list[[cond]]$result %>%
+    filter(query == "Upregulated", term_size <= 1000) %>%
+    arrange(p_value) %>%
+    slice(1:10) %>%
+    .$term_name
+
+  # Ensure that we have exactly 10 entries by padding with NA if necessary
+  top_upreg <- top_upreg[1:10]
+  if (length(top_upreg) < 10) {
+    top_upreg <- c(top_upreg, rep(NA, 10 - length(top_upreg)))
+  }
+
+  # Extract the top 10 downregulated pathways
+  top_downreg <- days_analysis_list[[cond]]$result %>%
+    filter(query == "Downregulated", term_size <= 1000) %>%
+    arrange(p_value) %>%
+    slice(1:10) %>%
+    .$term_name
+
+  # Ensure that we have exactly 10 entries by padding with NA if necessary
+  top_downreg <- top_downreg[1:10]
+  if (length(top_downreg) < 10) {
+    top_downreg <- c(top_downreg, rep(NA, 10 - length(top_downreg)))
+  }
+
+  # Add the pathways to the data frame
+  top_pathways_df[paste(cond, "Upregulated", sep = "_")] <- top_upreg
+  top_pathways_df[paste(cond, "Downregulated", sep = "_")] <- top_downreg
+}
+
+# Create the kable
+kable(top_pathways_df, caption = "Table 10: Top 10 upregulated and downregulated pathways for each temporal comparison. Intepretation of these results are in the Interpretation section.", align = 'c')
+```
+
+```{r}
+# Initialize an empty data frame to hold the top pathways for each condition and direction
+top_patient_pathways_df <- data.frame(matrix(ncol = length(names(patient_analysis_list)) * 2, nrow = 10))
+
+# Set the column names for the data frame
+colnames(top_patient_pathways_df) <- paste(rep(names(patient_analysis_list), each = 2), rep(c("Upregulated", "Downregulated"), times = length(names(patient_analysis_list))), sep = "_")
+
+# Fill the data frame with the top pathways
+for (cond in names(patient_analysis_list)) {
+  # Extract the top 10 upregulated pathways
+  top_upreg <- patient_analysis_list[[cond]]$result %>%
+    filter(query == "Upregulated", term_size <= 1000) %>%
+    arrange(p_value) %>%
+    slice(1:10) %>%
+    .$term_name
+
+  # Ensure that we have exactly 10 entries by padding with NA if necessary
+  top_upreg <- top_upreg[1:10]
+  if (length(top_upreg) < 10) {
+    top_upreg <- c(top_upreg, rep(NA, 10 - length(top_upreg)))
+  }
+
+  # Extract the top 10 downregulated pathways
+  top_downreg <- patient_analysis_list[[cond]]$result %>%
+    filter(query == "Downregulated", term_size <= 1000) %>%
+    arrange(p_value) %>%
+    slice(1:10) %>%
+    .$term_name
+
+  # Ensure that we have exactly 10 entries by padding with NA if necessary
+  top_downreg <- top_downreg[1:10]
+  if (length(top_downreg) < 10) {
+    top_downreg <- c(top_downreg, rep(NA, 10 - length(top_downreg)))
+  }
+
+  # Add the pathways to the data frame
+  top_patient_pathways_df[paste(cond, "Upregulated", sep = "_")] <- top_upreg
+  top_patient_pathways_df[paste(cond, "Downregulated", sep = "_")] <- top_downreg
+}
+
+# Create the kable
+kable(top_patient_pathways_df, caption = "Table 11: Top 10 upregulated and downregulated pathways for each patient comparison. Intepretation of these results are in the Interpretation section.", align = 'c')
+```
+
+# Interpretation
+
+### Do the over-representation results support conclusions or mechanism discussed in the original paper?
+
+It's quite complicated to say whether or not our data supports the conclusions made by the original paper.
+The reason for this is because the authors were using other datasets to compare differentiation protocols to see whether or not using a Wnt inhibitor while directing differentiation into cardiomyocytes would cause their hPSCs to be more akin to adult LV cardiomyocytes.
+Our data and analysis is restricted to just this dataset, so all we can comment on is what we found.
+With this in mind, we can begin to answer this question.
+Our pairwise day comparisons we indeed see many of the same terms being upregulated in Figure 2C of our article.
+These include terms like muscle tissue development, actin-mediated cell contraction, and more.
+Additionally, we also get some similar terms for down-regulation, including ncRNA metabolic process and ribosome biogenesis.
+Together, we see that our analysis concurs with the research group's, such that the protocol indeed up-regulated pathways related to creating cardiomyocytes and downregulated 'general' and 'stem-my' pathways as it differentiated.
+The other main analysis that we did was compare the most mature hPSC, our day60 one, to patient samples for the LV, RV, LA, and RA.
+Previously, we saw that there were no pathways that were up/down-regulated for LV and RV suggesting that they are quite similar to each other in terms of transciptome.
+Across all conditions, we see that pathways related to cellular respiration, oxidative phosphorylation, the mitotic cell cycle, DNA repair and regulation, and chromatin organization are upregulated in the patient samples compared to the hPSC-derived CM.
+This is likely because these samples came from cells that were from cadavers, and as a result, were cells that were involved in heart function and likely had higher metabolic demands in order to function in the heart.
+
+### Can you find evidence, i.e. publications, to support some of the results that you see? How does this evidence support your results?
+
+The article's main goal was to show that a methodology could be derived to improve the differentiation of hPSCs into cardiomyocytes more effectively, and their choice was to using CHIR to inhibit Wnt.
+When the authors compared their dataset to Cyganek et al.'s, they actually found that the other group's day 90 compared favourably to our group's day 60, indicating that our group's differentiation protocol was good at making mature cardiomyocytes more quickly.
+Now, for our analysis, it would have been nice for us to have been able to compare our analysis to the other group's day 90 to see if we had similar ORA results.
+Additionally, in a study looking at NOTCH1 knockouts by Ye et al., they also conducted a overrepresentation analysis, and in their day 10 cardiomyocytes, they had a similar result where pathways upregulating heart muscle development were favoured, and pathways involved in the cell cycle were downregulated.
+Together, this increases the confidence that our results show a robust differentiation protocol of hPSCs in cardiomyocytes.
+
+# Answers to Questions
+* Include a brief introduction section with a summary of the normalization and results done in the first assignment. Assume that the person reading the report has not read your assignment #1 report. Including basic statistics from that analysis will be helpful. [Assignment 1 Recap]
+
+* Calculate p-values for each of the genes in your expression set. How many genes were significantly differentially expressed? What thresholds did you use and why? [Determining p-Values]
+* Multiple hypothesis testing - correct your p-values using a multiple hypothesis correction method. Which method did you use? And Why? How many genes passed correction? [Determining p-Values]
+* Show the amount of differentially expressed genes using an MA Plot or a Volcano plot. Highlight genes of interest. [Volcano Plots]
+* Visualize your top hits using a heatmap. Do you conditions cluster together? Explain why or why not. [Heat Map]
+
+* Which method did you choose and why? [Setting up the g:Profiler]
+* What annotation data did you use and why? What version of the annotation are you using? [Setting up the g:Profiler]
+* How many genesets were returned with what thresholds? [Analyzing All Up and Down-Regulated Genes, Pooled]
+* Run the analysis using the up-regulated set of genes, and the down-regulated set of genes separately. How do these results compare to using the whole list (i.e all differentially expressed genes together vs. the up-regulated and down regulated differentially expressed genes separately)? This is addressed in all of the section due to the unique nature of my analysis. [Over-Representation analysis]
+
+* Do the over-representation results support conclusions or mechanism discussed in the original paper? [Interpretation]
+* Can you find evidence, i.e. publications, to support some of the results that you see. How does this evidence support your results. [Interpretation]
+
+# References
