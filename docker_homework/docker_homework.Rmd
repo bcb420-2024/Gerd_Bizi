@@ -1,0 +1,120 @@
+---
+title: "Docker_Homework"
+author: "Gerd Bizi"
+date: "2024-04-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+We've successfully made our Docker image. We will now do a quick test using a random matrix to determien log fold changes using DeSeq2.
+
+First, let's load in our libraries.
+
+```{r}
+library(DESeq2)
+library(knitr)
+library(dplyr)
+library(kableExtra)
+```
+
+Now, let's generate our matrix of integers with the appropriate column and row names.
+
+```{r}
+set.seed(123)  # for reproducibility
+count_data <- matrix(sample(1:100, 50, replace = TRUE), nrow = 5, ncol = 10)
+colnames(count_data) <- c("cond1", "cond2", "cond3", "cond4", "cond5", "ctrl1", "ctrl2", "ctrl3", "ctrl4", "ctrl5")
+rownames(count_data) <- paste("gene", 1:5, sep = "")
+```
+
+# DESeq2 Analysis
+
+Now, let's make a dataframe with our data for use with DESeq2
+
+```{r}
+# Create a DataFrame for the conditions
+conditions <- factor(c(rep("cond", 5), rep("ctrl", 5)))
+col_data <- DataFrame(condition = conditions)
+rownames(col_data) <- colnames(count_data)
+```
+
+Let's now run DESeq 2
+
+```{r}
+# Initialize the DESeqDataSet
+dds <- DESeqDataSetFromMatrix(countData = count_data,
+                              colData = col_data,
+                              design = ~ condition)
+
+# Run the differential expression analysis
+dds <- DESeq(dds)
+```
+
+Finally, let's extract the data from the `dds` object.
+
+```{r}
+# Get the results, including fold changes
+res <- results(dds, contrast = c("condition", "cond", "ctrl"))
+
+# Prepare data for the table
+table_data <- data.frame(
+  Gene = rownames(res),
+  Log2FoldChange = res$log2FoldChange,
+  FoldChange = exp(res$log2FoldChange)  # Converting log2 fold change to regular fold change
+)
+```
+
+Now, let's put our result in a table.
+
+```{r}
+# Use kable to create a nicely formatted table
+kable_table <- kable(table_data, format = "html", caption = "Table 1: Fold Changes from Control to Condition")
+
+# Add styling with kableExtra
+kable_styled <- kable_table %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+# Print the table
+kable_styled
+```
+
+# Non-DESeq2 Analysis
+
+For completion's sake, we'll do the same analysis without DESeq2.
+
+First, let's calculate the condition and control means, and then the fold changes
+```{r}
+# Calculate mean for conditions and controls
+cond_means <- rowMeans(count_data[, 1:5])
+ctrl_means <- rowMeans(count_data[, 6:10])
+
+# Compute fold change and log2 fold change
+fold_change <- cond_means / ctrl_means
+log2_fold_change <- log2(fold_change)
+```
+
+Now, let's put our dataresults in a table
+
+```{r}
+# Prepare data for the table
+table_data <- data.frame(
+  Gene = rownames(count_data),
+  FoldChange = fold_change,
+  Log2FoldChange = log2_fold_change
+)
+
+# Use kable to create a nicely formatted table
+kable_table <- kable(table_data, format = "html", caption = "Table 2: Manual Fold Changes from Control to Condition")
+
+# Add styling with kableExtra
+kable_styled <- kable_table %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+kable_styled
+```
+
+
