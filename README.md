@@ -10,6 +10,8 @@ Link to Gerd Bizi's [A1](https://github.com/bcb420-2024/Gerd_Bizi/blob/main/a1/a
 
 Link to Gerd Bizi's [A2](https://github.com/bcb420-2024/Gerd_Bizi/blob/main/a2/a2.html)
 
+Link to Gerd Bizi's [A3](https://github.com/bcb420-2024/Gerd_Bizi/blob/main/a3/a3.html)
+
 [![CC BY 4.0][cc-by-shield]][cc-by]
 
 This work is licensed under a
